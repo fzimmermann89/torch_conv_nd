@@ -84,6 +84,9 @@ indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
 
+[tool.ty.rules]
+unresolved-attribute = "ignore"
+
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true

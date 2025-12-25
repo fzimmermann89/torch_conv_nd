@@ -1,22 +1,21 @@
 """N-dimensional convolution with flexible dimension specification."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
 CONV_REGISTRY: dict[int, Callable[..., Tensor]] = {
-    1: F.conv1d,
-    2: F.conv2d,
-    3: F.conv3d,
+    1: torch.nn.functional.conv1d,
+    2: torch.nn.functional.conv2d,
+    3: torch.nn.functional.conv3d,
 }
 
 CONV_TRANSPOSE_REGISTRY: dict[int, Callable[..., Tensor]] = {
-    1: F.conv_transpose1d,
-    2: F.conv_transpose2d,
-    3: F.conv_transpose3d,
+    1: torch.nn.functional.conv_transpose1d,
+    2: torch.nn.functional.conv_transpose2d,
+    3: torch.nn.functional.conv_transpose3d,
 }
 
 
@@ -182,7 +181,7 @@ def _conv_recursive(
     """Decompose N-D conv: sum over first kernel dim of (N-1)-D convs."""
     if padding[0] > 0:
         pad_spec = (0, 0) * (x.ndim - 3) + (padding[0], padding[0])
-        x = F.pad(x, pad_spec)
+        x = torch.nn.functional.pad(x, pad_spec)
 
     kernel_size = weight.shape[2]
     input_size = x.shape[2]
@@ -258,6 +257,234 @@ def _conv_transpose_recursive(
         result = result[:, :, :-right_adjust]
     elif right_adjust < 0:
         pad_spec = (0, 0) * (result.ndim - 3) + (0, -right_adjust)
-        result = F.pad(result, pad_spec)
+        result = torch.nn.functional.pad(result, pad_spec)
 
     return result
+
+
+def pad_nd(
+    input: Tensor,
+    pad: Sequence[int],
+    mode: str = "constant",
+    value: float = 0.0,
+    dims: Sequence[int] | None = None,
+) -> Tensor:
+    """
+    N-dimensional padding/cropping supporting arbitrary dimensions.
+
+    Parameters
+    ----------
+    input
+        Input tensor.
+    pad
+        Padding sizes as pairs (left, right) per dimension.
+        Negative values crop. Without `dims`: PyTorch convention.
+    mode
+        'constant', 'circular', 'reflect', or 'replicate'.
+    value
+        Fill value for 'constant' mode.
+    dims
+        Dimensions to pad. If None, pads last N dimensions.
+
+    Returns
+    -------
+        Padded/cropped tensor.
+    """
+    if len(pad) % 2 != 0:
+        raise ValueError("pad must have even length")
+
+    n_dims = len(pad) // 2
+    if n_dims == 0:
+        return input
+
+    ndim = input.ndim
+
+    if dims is None:
+        target_dims = list(range(ndim - 1, ndim - n_dims - 1, -1))
+        pad_pairs = [(pad[2 * i], pad[2 * i + 1]) for i in range(n_dims)]
+    else:
+        if len(dims) != n_dims:
+            raise ValueError("len(dims) must equal len(pad) // 2")
+        target_dims = [d % ndim for d in dims]
+        pad_pairs = [(pad[2 * i], pad[2 * i + 1]) for i in range(n_dims)]
+        if len(set(target_dims)) != len(target_dims):
+            raise ValueError("duplicate dimensions not supported")
+
+    if mode == "constant":
+        return _pad_constant(input, target_dims, pad_pairs, value)
+
+    return _pad_non_constant(input, target_dims, pad_pairs, mode)
+
+
+def pad_or_crop_to_size(
+    input: Tensor,
+    size: Sequence[int],
+    mode: str = "constant",
+    value: float = 0.0,
+    dims: Sequence[int] | None = None,
+) -> Tensor:
+    """
+    Pad or crop tensor to target size, centering the original content.
+
+    Parameters
+    ----------
+    input
+        Input tensor.
+    size
+        Target sizes for each dimension to adjust.
+    mode
+        'constant', 'circular', 'reflect', or 'replicate'.
+    value
+        Fill value for 'constant' mode.
+    dims
+        Dimensions to adjust. If None, adjusts last len(size) dimensions.
+
+    Returns
+    -------
+        Tensor with specified dimensions resized to target.
+    """
+    ndim = input.ndim
+
+    if dims is None:
+        target_dims = list(range(ndim - len(size), ndim))
+    else:
+        if len(dims) != len(size):
+            raise ValueError("len(dims) must equal len(size)")
+        target_dims = [d % ndim for d in dims]
+
+    pad_list: list[int] = []
+    for dim, target in zip(target_dims, size):
+        diff = target - input.shape[dim]
+        pad_list.extend([diff // 2, diff - diff // 2])
+
+    return pad_nd(input, pad_list, mode=mode, value=value, dims=target_dims)
+
+
+def _pad_constant(
+    input: Tensor,
+    target_dims: list[int],
+    pad_pairs: list[tuple[int, int]],
+    value: float,
+) -> Tensor:
+    dim_to_pad = dict(zip(target_dims, pad_pairs))
+
+    full_pad: list[int] = []
+    for d in range(input.ndim - 1, -1, -1):
+        full_pad.extend(dim_to_pad.get(d, (0, 0)))
+
+    while len(full_pad) > 2 and full_pad[-2:] == [0, 0]:
+        full_pad = full_pad[:-2]
+
+    return torch.nn.functional.pad(input, full_pad, mode="constant", value=value)
+
+
+def _pad_non_constant(
+    input: Tensor,
+    target_dims: list[int],
+    pad_pairs: list[tuple[int, int]],
+    mode: str,
+) -> Tensor:
+    result = input
+
+    for i in range(0, len(target_dims), 3):
+        chunk_dims = target_dims[i : i + 3]
+        chunk_pads = pad_pairs[i : i + 3]
+
+        other_dims = [d for d in range(result.ndim) if d not in chunk_dims]
+        perm = other_dims + chunk_dims
+
+        inv_perm = [0] * len(perm)
+        for old_pos, new_pos in enumerate(perm):
+            inv_perm[new_pos] = old_pos
+
+        result = result.permute(perm)
+        batch_shape = result.shape[: len(other_dims)]
+
+        if len(batch_shape) == 0:
+            result = result.unsqueeze(0)
+        elif len(batch_shape) > 1:
+            result = result.flatten(0, len(batch_shape) - 1)
+
+        n_unsqueeze = max(0, len(chunk_dims) + 2 - result.ndim)
+        for _ in range(n_unsqueeze):
+            result = result.unsqueeze(1)
+
+        flat_pad = [p for lr in reversed(chunk_pads) for p in lr]
+        result = torch.nn.functional.pad(result, flat_pad, mode=mode)
+
+        for _ in range(n_unsqueeze):
+            result = result.squeeze(1)
+
+        if len(batch_shape) == 0:
+            result = result.squeeze(0)
+        elif len(batch_shape) > 1:
+            result = result.unflatten(0, batch_shape)
+
+        result = result.permute(inv_perm)
+
+    return result
+
+
+def adjoint_pad_nd(
+    input: Tensor,
+    pad: Sequence[int],
+    mode: str = "constant",
+    value: float = 0.0,
+    dims: Sequence[int] | None = None,
+    original_sizes: Sequence[int] | None = None,
+) -> Tensor:
+    """
+    Adjoint of pad_nd via autograd - computes backward of padding as forward op.
+
+    Parameters
+    ----------
+    input
+        Padded tensor (output space of pad_nd).
+    pad
+        Padding sizes as pairs (left, right) per dimension (same as pad_nd).
+    mode
+        'constant', 'circular', 'reflect', or 'replicate'.
+    value
+        Fill value for 'constant' mode.
+    dims
+        Dimensions that were padded. If None, assumes last N dimensions.
+    original_sizes
+        Original sizes of the padded dimensions before padding.
+        Required to reconstruct the unpadded shape.
+
+    Returns
+    -------
+        Tensor with padding adjoint applied (unpadded shape).
+    """
+    if len(pad) % 2 != 0:
+        raise ValueError("pad must have even length")
+
+    n_dims = len(pad) // 2
+    if n_dims == 0:
+        return input
+
+    ndim = input.ndim
+
+    if dims is None:
+        target_dims = list(range(ndim - 1, ndim - n_dims - 1, -1))
+    else:
+        if len(dims) != n_dims:
+            raise ValueError("len(dims) must equal len(pad) // 2")
+        target_dims = [d % ndim for d in dims]
+
+    if original_sizes is None:
+        original_sizes = []
+        for i, d in enumerate(target_dims):
+            left, right = pad[2 * i], pad[2 * i + 1]
+            original_sizes.append(input.shape[d] - left - right)
+
+    unpadded_shape = list(input.shape)
+    for i, d in enumerate(target_dims):
+        unpadded_shape[d] = original_sizes[i]
+
+    x = torch.zeros(unpadded_shape, device=input.device, dtype=input.dtype, requires_grad=True)
+    y = pad_nd(x, pad, mode=mode, value=value, dims=dims)
+    (gx,) = torch.autograd.grad(
+        y, x, grad_outputs=input, retain_graph=False, create_graph=input.requires_grad
+    )
+    return gx
